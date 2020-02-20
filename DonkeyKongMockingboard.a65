@@ -1,0 +1,1029 @@
+;*************************************************************
+;* FILE: DonkeyKongMoockingboard.a65
+;*************************************************************
+;* Description:
+;*  Simple music player for the Apple II's Mockingboard.
+;*  Based loosely on a Z80 program I found with the Virtual Aquarius emulator
+;*  It plays the same song data anyway.
+;*  Initial 6502 port was for the Oric which also interfaces
+;*  the AY sound chip through a VIA chip similar to the Mockingboard.
+;*  
+;*  Uses VIA timer to trigger the interrupt,
+;*  other machines may use the vertical blank interrupt.
+;*  Designed for the General Instruments AY sound chip but will work
+;*  with any sound chip with an internal address register and a data register if your
+;*  data is designed for the chip.
+;*
+;*  The current version assembles with the ca65 assembler included with the
+;*  cc65 6502 C compiler package.
+;*
+;*  If you run across opcodes in capital letters, those lines were probably copied from
+;*  the Mockingboard demo source code.
+;*  The code is fairly well documented but there is always room for improvement
+;*  The code supports 1 or 2 AY chips but 2nd chip support is untested at this time
+;*
+;* To do:
+;*  Move setting of ORG address ranges (page zero and program) to the linker instead
+;*  of hard coding it.
+;*  Set build condition DEFINES externally??
+;*  Make unit test code properly exit.
+;*  Verify VIA settings for disabling interrupt.
+;*  I should probably look at making the VIA definitions a data structure.
+;*  Documentation, documentation, documentation
+;*  Check the code into a version control system.
+;*  The player destruct may need some revisions but I won't know until
+;*  I perform further testing.
+;*  Resetting the sound chip is a bad way to stop a song if other sounds are being
+;*  played on the same chip.  We should output sound data to the sound chip instead.
+;*  Move sound/music data external and link to it with the linker.
+;*  The player is getting page 0 heavy.  I could use a catch all temporary pointer
+;*  in place of dedicated pointers like songs, sound, and myjmp.  It would burn
+;*  a few more clocks when starting a song but that shouldn't be too often.
+;*  Data could be dumped to the sound chip to initialize settings in the playsong
+;*  routine so those settings could be removed from multiple songs.
+;*  playing and waitcount could be moved off of page zero if really needed.
+;*  Move page zero variables; I think they are conflicting with the monitor or DOS.
+;*
+;* Song Data Format:
+;*	;wait, number of registers to change,
+;*	;	register number, new value
+;*	;	register number, new value
+;*	;	etc.
+;*	; ends when number of registers to change is 0.
+;*  ; repeats when number of registers to change is 255.
+;*  ;
+;*  ; Note that register numbers with the uppermost bit set to 1 (i.e. negative)
+;*  ; will be sent to the 2nd AY chip on the Mockingboard
+;*  ; That bit is just a flag and is masked off to send data to the 2nd AY chip
+;*
+;* Author: James Diffendaffer
+;*   Copyright(c) 2009-2015
+;*
+;*   This software may be freely distributed but please give me credit if you
+;*   use it.
+;*
+;*   Created May 29, 2009 for the Oric
+;*   Ported to the Apple II with Mockingboard Nov 23, 2012
+;*
+;* Version Date/Time:
+;*   Mar 2, 2015 - 12:00 AM
+;* 
+;* Version update info:
+;*   Fixed some spelling errors including ones that were in code I had copied
+;*   Made small optimization to 6502 command call
+;*   Added initial support for a 16 bit free running timer on page 0 
+;************************************************************* 
+
+
+
+;************************************************************* 
+;* Set build conditions here.
+;*
+;* Nothing else *should* need to be modified if I've done this right
+;* The code does currently assume songs follow the code but that will eventually change
+;************************************************************* 
+.DEFINE	UNITTEST	1		; set to non-zero value to enable the stand along unit test code, otherwise build to link to external program
+.DEFINE USE_C02		0		; set to use 65C02 instructions. 1 = standard 65C02 or above, 2 = Rockwell/WDC 65C02 or above
+.DEFINE USE_CMD		1		; set to non-zero value to use additional commands in the song data
+.DEFINE USE_NTSC	1		; set to non-zero value to use NTSC VIA Timer settings, otherwise PAL
+.DEFINE BIGSONGS	1		; set to non-zero value if songs will cross a 256 byte memory page. 
+.DEFINE	TWO_VIAS	1		; set to non-zero value if songs will use 2 AY chips
+.DEFINE	DOSHEADER	0		; set to non-zero to attach a DOS 3.3 header at the start of the file (used by a2tools)
+.DEFINE USE_TIMER	0		; set to non-zero to include code for a free running 16 bit timer
+
+.DEFINE PAGEZERO	$00EB	; set the org address for page zero variables here
+;.DEFINE PAGEZERO	$0090	; set the org address for page zero variables here
+.IF UNITTEST
+.DEFINE STARTCODE	$8000	; set the org address for the unit test code section here
+.ELSE
+.DEFINE	STARTCODE	$8000	; PUT YOUR START ADDRESS HERE AND SET UNIT TEST TO 0
+.ENDIF
+;************************************************************* 
+
+
+
+; Apple specific hardware and ROM call definitions.  Used by the unit test code
+.DEFINE	KEYBOARD	$C000	; address of Apple II keyboard
+.DEFINE STROBE		$C010	; keyboard strobe
+.DEFINE	COUT1		$FDF0	; ROM routine to print a character
+.DEFINE	CROUT		$FD8E	; ROM routine to print a return
+.DEFINE	PRBYTE		$FDDA	; ROM routine to output A as 2 digit HEX
+.DEFINE	IOSAVE		$FF4A	; save all registers
+.DEFINE	IOREST		$FF3F	; restore all registers
+.DEFINE	IRQloc		$03FE	; Apple II IRQ handler address
+
+
+; VIA register definitions for the first Mockingboard 6522
+.DEFINE	VIAIORB		$C400	; IO Register B
+.DEFINE	VIAIORA		$C401	; IO Register A
+.DEFINE VIADDRB		$C402	; Data Direction Register B
+.DEFINE VIADDRA 	$C403	; Data Direction Register A
+.DEFINE	VIA_T1C		$C404	; Read/Write Counter Low-High T1
+.DEFINE	VIA_T1L		$C406	; Read/Write Latch Low-High T1
+.DEFINE	VIA_ACR		$C40B	; Auxiliary Control Register
+.DEFINE	VIA_PCR		$C40C	; Peripheral Control Register;
+.DEFINE VIA_IFR		$C40D	; Interrupt Flag Register
+.DEFINE	VIA_IER 	$C40E	; Interrupt Enable Register
+
+
+; VIA register definitions for the second Mockingboard 6522
+.DEFINE	VIA2IORB	$C480	; IO Register B
+.DEFINE	VIA2IORA	$C481	; IO Register A
+.DEFINE VIA2DDRB	$C482	; Data Direction Register B
+.DEFINE VIA2DDRA	$C483	; Data Direction Register A
+.DEFINE	VIA2_T1C	$C484	; Read/Write Counter Low-High T1
+.DEFINE	VIA2_T1L	$C486	; Read/Write Latch Low-High T1
+.DEFINE	VIA2_ACR	$C48B	; Auxiliary Control Register
+.DEFINE	VIA2_PCR	$C48C	; Peripheral Control Register;
+.DEFINE VIA2_IFR	$C48D	; Interrupt Flag Register
+.DEFINE	VIA2_IER 	$C48E	; Interrupt Enable Register
+
+
+; VIA timer settings
+.IF	USE_NTSC
+.DEFINE	VBLVIA	$40FF		; VIA Timer Latch, settings matching NTSC 60Hz (from mockingboard demo)
+;.DEFINE	VBLVIA	$4100		; VIA Timer Latch, settings matching NTSC 60Hz
+.ELSE
+.DEFINE	VBLVIA	$4E00		; VIA Timer Latch, settings matching PAL 50Hz
+.ENDIF
+
+
+;**************************************************************
+	.BSS	
+
+.ZEROPAGE				; page zero variables
+
+; The zeropage address should be set by the linker
+	.org	PAGEZERO	; our page zero start address
+
+playing:	.RES	1	; flag to indicate whether the player is active or not
+waitcount:	.RES	1	; counter for number of interrupts till next song data is read
+song:		.RES	2	; pointer to current location in the song we are playing
+songs:		.RES	2	; pointer to song table
+sound:		.RES	2	; pointer to a block of sound data
+
+.IF USE_CMD
+;cmds:		.RES	2	; page zero command table pointer
+;myjmp:		.RES	2	; page zero jump address for command being called
+temp:		.RES	1	; temporary storage (for the Y register)
+.ENDIF
+
+.IF USE_TIMER
+timer:		.RES	2	; page zero free running timer that is incremented every interrupt
+.ENDIF
+
+.CODE
+
+.IF DOSHEADER
+;**************************************************************
+;* DOS 3.3 header
+;**************************************************************
+;*
+;**************************************************************
+	.org	STARTCODE-4
+	.word	STARTCODE					; Program Start Address			
+	.word	DATAEND-STARTCODE			; Program Length
+;**************************************************************
+.ENDIF
+
+	.org	STARTCODE
+
+.IF UNITTEST
+;**************************************************************
+;* main
+;**************************************************************
+;* Description:
+;*   This is the main routine for the unit test code.
+;*   It calls routines to initialize the hardware/software,
+;*   plays the song, performs a busy loop until the song is done,
+;*   and then calls the stopsong to disable playing.
+;**************************************************************
+_main:
+	jsr	IOSAVE				; save registers
+	jsr	CROUT				; output a carriage return
+
+	jsr	playerinit			; initialize the player and sound hardware
+
+.IF USE_C02 > 0
+	stz	temp				; song number
+.ELSE
+	lda	#0					; song number
+	sta	temp
+.ENDIF
+
+screenloop:
+	jsr	PRBYTE				; output A as HEX
+	jsr	CROUT				; output a carriage return
+
+	lda	temp
+	jsr	playsongina
+
+	; wait for a keypress or for the song to finish
+	; keybounce seems to be an issue
+.IF	USE_C02 > 0
+	stz	STROBE				; CLEAR KEYBOARD STROBE
+.ELSE
+	lda	#$00
+	STA	STROBE				; CLEAR KEYBOARD STROBE
+.ENDIF
+@loop:
+	lda	KEYBOARD			; get input status
+	bmi	@quit				; exit if a keypress has taken place
+.IF	USE_C02 > 1
+	bbs7	playing,@loop
+.ELSE
+	lda	#!10000000				
+	bit	playing				; check to see if the song has finished
+;	beq	@quit				; quit if it has
+	bne	@loop				; keep looking if neither condition has taken place.
+.ENDIF
+@quit:
+	jsr	stopsong			; stop playing and stop AY output
+	
+	inc	temp
+	lda	temp
+	cmp	#14
+	bcc	screenloop
+
+	jsr	playerdestruct		; remove our interrupt and cleanup
+	
+exittest:
+	jmp	IOREST				;restore registers and return
+
+;temp:
+;	.byt	1				; hold our screen number
+	
+;**************************************************************
+.ENDIF
+
+
+;**************************************************************
+;* playerinit
+;**************************************************************
+;* Description:
+;*   Initialize the music player and mockingboard hardware
+;*   Sets up the interrupt handler and any page 0 variables
+;*   it requires.
+;* Parameters:
+;*   None
+;* Modifies:
+;*   A
+;* Returns:
+;*   Garbage
+;**************************************************************
+playerinit:
+	sei						; disable interrupts
+	
+;.IF USE_CMD
+;	; set the start address of the commandtable
+;	lda	#<commandtable
+;	sta	cmds
+;	lda	#>commandtable
+;	sta	cmds+1
+;.ENDIF
+	; set the start address of the songtable
+	lda	#<songtable
+	sta	songs
+	lda	#>songtable
+	sta	songs+1
+
+	;save current interrupt handler address
+	lda	IRQloc
+	sta	SAVE_IRQ
+	lda	IRQloc+1
+	sta	SAVE_IRQ+1
+
+	;add our interrupt handler
+	lda	#<IrqHandler		; address of our interrupt handler
+	sta	IRQloc
+	lda	#>IrqHandler
+	sta	IRQloc+1
+
+.IF USE_C02 > 0
+	stz	playing
+	; reset AY chip
+	stz	VIAIORB				;TO SOUND CHIP
+.IF TWO_VIAS
+	stz	VIA2IORB			;TO SOUND CHIP
+.ENDIF
+.ELSE
+	; tell the player we are not playing anything at the moment
+	lda	#$00
+;	lda	playing
+;	and	#!01111111
+	sta	playing
+
+	; reset AY chip
+	lda	#$00				;SEND "RESET COMMAND"
+	sta	VIAIORB				;TO SOUND CHIP
+.IF TWO_VIAS
+	sta	VIA2IORB			;TO SOUND CHIP
+.ENDIF
+.ENDIF
+
+	lda	#$04				;THROUGH PORT B
+	sta	VIAIORB
+.IF TWO_VIAS
+	sta	VIA2IORB
+.ENDIF
+
+	;setup first AY chip for access
+	LDA	#$FF				;SET PORT A FOR OUTPUT
+	STA	VIADDRA		
+.IF TWO_VIAS
+	STA	VIA2DDRA		
+.ENDIF
+	LDA	#$07				;SET PORT B FOR OUTPUT
+	STA	VIADDRB
+.IF TWO_VIAS
+	STA	VIA2DDRB
+.ENDIF
+
+	; set up a VIA timer for our interrupt. Set our VIA_T1 value for 50Hz or 60Hz as defined above
+	lda	#<VBLVIA
+	sta	VIA_T1C
+	lda	#>VBLVIA
+	sta	VIA_T1C+1
+
+	LDA	#$40				;!0100 0000 = continuous timed interrupts, pb7 disabled
+	STA	VIA_ACR
+	LDA	#$7F
+	STA	VIA_IER
+	LDA	#$C0				;!1100 0000 = time-out of T1, any enabled interrupt
+	STA	VIA_IFR
+	STA	VIA_IER
+
+	cli						; enable interrupts
+	
+	rts
+;**************************************************************
+
+
+
+;**************************************************************
+;* playerdestruct
+;**************************************************************
+;* Description:
+;*   Disables the timer on the 6522 VIA
+;*   and restores the previous interrupt handler's address
+;* Parameters:
+;*   None.
+;* Modifies:
+;*   A
+;* Returns:
+;*   Garbage
+;**************************************************************
+playerdestruct:
+	sei						; disable interrupts
+
+.IF	USE_C02 > 0
+	stz	VIA_ACR
+	stz	VIA_IER
+.ELSE
+	; disable the timer
+	lda	#$00				;!0000 0000
+	sta	VIA_ACR
+	sta	VIA_IER
+.ENDIF
+	; clear any VIA timer interrupts on the chip we are using 
+	lda	#$C0
+	sta	VIA_IFR
+	
+	;restore previous interrupt handler address
+	lda	SAVE_IRQ
+	sta	IRQloc
+	lda	SAVE_IRQ+1
+	sta	IRQloc+1
+
+	cli						; enable interrupts
+	
+	rts
+;**************************************************************
+	
+	
+	
+;**************************************************************
+;* playsongina
+;**************************************************************
+;* Description:
+;*   This plays the song # in the A register from a table of song pointers
+;* Parameters:
+;*   A - song number
+;* Modifies:
+;*   A, Y, songstart
+;* Returns:
+;*   garbage
+;**************************************************************
+playsongina:
+	asl						; multipy by 2 to get our table index (pointers are two bytes long)
+	tay
+	lda	(songs),y			; load the LSB of the song address
+	sta	songstart			; save in the LSB of the pointer for the currently playing song
+	iny
+	lda	(songs),y			; load the MSB of the song address
+	sta	songstart+1			; save in the MSB of the pointer for the currently playing song
+
+; falls through to playsong
+;**************************************************************
+
+
+
+;**************************************************************
+;* playsong
+;**************************************************************
+;* Description:
+;*	 Plays a song
+;* Parameters:
+;*   songstart
+;* Modifies:
+;*   A, song
+;* Returns:
+;*   garbage
+;**************************************************************
+playsong:
+	; set the start address of the song
+	lda	songstart
+	sta	song
+	lda	songstart+1
+	sta	song+1
+.IF USE_C02 > 1
+	smb7	playing			; if bit 7 is set, we are playing
+.ELSE
+	lda	playing
+	ora	#!10000000			; if bit 7 is set, we are playing
+	sta	playing
+.ENDIF	
+	rts						; return
+;**************************************************************
+
+
+	
+;**************************************************************
+;* stopsong
+;**************************************************************
+;* Description:
+;*   This subroutine is called to stop the music player,
+;*   remove the interrupt handler, and clear VIA timer settings
+;* Parameters:
+;*   None.
+;* Modifies:
+;*   A
+;* Returns:
+;*   garbage
+;**************************************************************
+stopsong:
+	sei						; disable interrupts
+
+.IF	USE_C02 > 0
+	;stop sounds by resetting AY chip.  All AY settings are lost
+	stz	VIAIORB				;SEND "RESET COMMAND" TO SOUND CHIP
+.IF TWO_VIAS
+	stz	VIA2IORB			;SEND "RESET COMMAND" TO 2nd SOUND CHIP
+.ENDIF
+.ELSE
+	;stop sounds by resetting AY chip.  All AY settings are lost
+	lda	#$00				;SEND "RESET COMMAND"
+	sta	VIAIORB				;TO SOUND CHIP
+.IF TWO_VIAS
+	sta	VIA2IORB			;TO SOUND CHIP
+.ENDIF
+.ENDIF
+.IF USE_C02 > 1
+	rmb7	playing			; tell the player not to play
+.ELSE
+	lda	playing
+	and	#!01111111
+	sta	playing				; tell the player not to play
+.ENDIF
+
+	lda	#$04				;THROUGH PORT B
+	sta	VIAIORB
+.IF TWO_VIAS
+	sta	VIA2IORB
+.ENDIF
+	
+	cli						; enable interrupts
+
+	rts						; return 
+
+;**************************************************************
+
+
+
+;**************************************************************
+;* IrqHandler
+;**************************************************************
+;* Description:
+;*   Vertical Blank or Timer interrupt handler
+;*   Contains the code that actually plays the song
+;*   (data is output via outputsounddata)
+;* Parameters:
+;*   None but the VIA_IFR should contain the interrupt info.
+;* Modifies:
+;*   It's an interrupt, everything we modify must be saved except status
+;*   which is saved automatically.
+;*   Modifies the free running timer on exit if enabled 
+;* Returns:
+;*   All registers are preserved but the song and sound pointers
+;*   on page zero may be modified.
+;**************************************************************
+IrqHandler:
+	pha						; preserve A
+	
+	;from the Mockingboard demo code
+	LDA	#$C0				; clear the 6522 interrupt flag
+	STA	VIA_IFR 
+
+.IF USE_C02 = 2
+	bbr7	playing,exit_int	; exit if we aren't playing
+.ELSE
+	lda	playing				; check playing flag
+	bpl	exit_int			; exit if not
+.ENDIF
+
+	;	wait for interrupt, waitcount times
+	dec	waitcount			; decrement the counter
+	bne	exit_int			; exit if not done waiting
+
+	; if we get here, we need to save X and Y on the stack
+.IF	USE_C02 > 0
+	phx						;65c02
+	phy						;65c02
+.ELSE
+	txa
+	pha
+	tya
+	pha
+.ENDIF	
+
+	; load waitcount every time, it saves more cycles that putting it in updatesong
+	ldy	#0					; offset from song pointer, Y must be used for this addressing mode on the 6502
+	lda	(song),y			; get the new wait counter
+	sta	waitcount			; save the new wait counter
+
+	iny						; increment song index
+	lda	(song),y			; get number of registers to modify
+	beq	playsongend			; zero is end of song
+
+.IF USE_CMD
+	bmi	docomnd				; negative numbers are commands
+.ELSE
+	bpl	notrepeat			; If it's a positive number, it's not a repeat indicator
+	
+	; song repeats endlessly until shut off
+	; set the start address of the song
+	lda	songstart
+	sta	song
+.IF BIGSONGS
+	lda	songstart+1			; MSB should only need updated if song can cross a 256 byte page
+	sta	song+1
+.ENDIF
+
+
+.IF USE_C02 > 0
+	bra	updatesong			; update the waitcount and song pointer as well
+.ELSE
+;	jmp	updatesong			; update the waitcount and song pointer as well
+	bvc	updatesong			; update the waitcount and song pointer as well
+.ENDIF
+
+;-----------------
+notrepeat:
+.ENDIF
+
+	tax						; put AY register count in X
+	iny						; next byte in song
+
+	;*********
+	; copy song pointer to sound pointer for output	
+	; if sounds and songs can fit on a single page, the MSB only needs set once when initializing.
+	lda	<song
+	sta	<sound
+	lda	>song				; MSB
+	sta	>sound				; MSB
+
+	jsr	outputsounddata		; output a stream of data to the sound chip
+	;*********
+
+;-----------------
+updatesong:
+	; update the song pointer (16 bit song pointer + 8 bit index)
+	; (songLSB + y, if carry set then songMSB++)
+	tya						; put song pointer offset in A
+	adc	song				; add low byte (LSB)
+	sta	song				; update low byte
+
+.IF BIGSONGS
+	; the next few instructions are only needed if any songs will cross a 256 byte memory page
+	bcc	@skipadd			; don't increment the MSB if the carry flag isn't set
+	inc	song+1				; update the song pointer
+@skipadd:
+.ENDIF
+;-----------------
+exit_int2:
+	; restore the registers we saved
+.IF	USE_C02 > 0
+	ply						; 65c02
+	plx						; 65c02
+.ELSE
+	pla
+	tay
+	pla
+	tax
+.ENDIF
+
+;-----------------
+exit_int:
+.IF	USE_TIMER > 0
+	;free running timer code. 
+	inc	timer<				;increment the low byte of the free running timer.  Sets Z bit if it wraps around
+	bne	@skip_timer			;branch if low byte of timer doesn't roll over
+	inc	timer>				;increment the high byte of the free running timer
+@skip_timer:
+.ENDIF
+	pla						; restore the accumulator
+	rti						; return from our interrupt
+;*****
+
+;-----------------
+playsongend:
+	; restoring x is not needed for the end of a song but is included as a command example
+;	ldx	temp				; restore x from command call
+
+.IF	USE_C02 = 2
+;	stz	playing				; when we encounter the end of song marker we just set a flag and stop playing
+	rmb7	playing			; when we encounter the end of song marker we just set a flag and stop playing
+.ELSEIF USE_C02 = 1
+	trb	playing
+.ELSE
+;	lda	#0
+	lda	playing
+	and	#!01111111
+	sta	playing				; when we encounter the end of song marker we just set a flag and stop playing
+.ENDIF
+;	beq	exit_int2			; branch always
+	bvc	exit_int2			; branch always
+;**************************************************************
+
+
+
+
+;**************************************************************
+;* outputsounddata
+;**************************************************************
+;* Description:
+;*   Outputs a block of bytes to the Mockingboard
+;*   Can be used to initialize the sound chip,
+;*   play one shot sounds, etc...
+;* Modifies:
+;*   A, X, Y
+;* Parameters:
+;*   sound - points to sound data to be output
+;*   X - contains number of bytes to output
+;*   Y - contains offset to start at in song.  Normally zero.
+;* Returns:
+;*   Y - contains offset to last byte pointed to
+;* Pitfalls:
+;*   Does not update sound pointer when crossing a page boundary.
+;*   If you output more than 128 values (why would you?)
+;*   to the sound chip, Y goes negative and points to the wrong
+;*   location. 
+;**************************************************************
+outputsounddata:
+reglop:
+	; Select the register number
+	lda	(sound),y			; get the register number to modify
+
+; for using two sound chips
+.IF TWO_VIAS
+	bpl	firstvia			; branch if not negative (first VIA & AY)
+
+	and	#!01111111			; mask off the sign bit
+	sta	VIA2IORA			; set the AY data register number
+
+	; latch command
+	LDA	#$07				;SEND "LATCH COMMAND"
+	STA	VIA2IORB			;TO SOUND CHIP
+	LDA	#$04				;THROUGH PORT B
+	STA	VIA2IORB
+	
+
+	iny						; point to next byte in song
+	lda	(sound),y			; get the Value for the AY register
+	sta	VIA2IORA
+	
+	; write command
+	LDA	#$06				;SEND "WRITE COMMAND"
+	STA	VIA2IORB			;TO SOUND CHIP
+	LDA	#$04				;THROUGH PORT B
+	STA	VIA2IORB
+	bpl	continue			; always branch to continue
+firstvia:
+.ENDIF
+
+;there is a bug in this sequence of commands.
+;it works on the emulator but not the real hardware.
+	sta	VIAIORA				; set the AY data register number
+
+	; latch command
+	LDA	#$07				;SEND "LATCH COMMAND"
+	STA	VIAIORB				;TO SOUND CHIP
+	LDA	#$04				;THROUGH PORT B
+	STA	VIAIORB
+	
+	iny						; point to next byte in song
+	lda	(sound),y			; get the Value for the AY register
+	sta	VIAIORA
+	
+	; write command
+	LDA	#$06				;SEND "WRITE COMMAND"
+	STA	VIAIORB				;TO SOUND CHIP
+	LDA	#$04				;THROUGH PORT B
+	STA	VIAIORB
+
+continue:	
+	iny						; point to next byte in song
+	dex						; decrement the register count
+	bne	reglop				; keep looping if not done setting registers
+	
+	rts
+;**************************************************************
+
+	
+
+
+.IF USE_CMD
+;**************************************************************
+;* docomnd
+;**************************************************************
+;* Description:
+;*   code to handle optional commands embedded within the song data
+;*   this is not enabled for Donkey Kong and does not assemble
+;* Parameters:
+;*   None
+;* Modifies:
+;*   A
+;* Returns:
+;*   Whatever the command returns (garbage?)
+;**************************************************************
+docomnd:
+	stx	temp				; save x, x must be restored by the end of each command
+
+	; register A contains the command number + 128
+	;and	#!01111111			; clear the bit for 128 (not needed, shift removes it)
+	; convert the command nuber to the table offset
+
+	; get command address from command pointer table (self modifying code)
+.IF	USE_C02 > 0
+	asl							; multiply by 2 (addresses are 2 bytes in size)
+	tax							; move the command table offset to x
+	jmp	(commandtable,x)
+.ELSE
+;.IF  = 0
+	; table does not cross a page boundary and code is not in ROM
+	asl							; multiply by 2
+	sta	tcall+1					; modify the table address lsb
+tcall:
+	jmp	(commandtable)			; make the indirect jump
+;.ELSE
+;	; table crosses a page boundary or code is in ROM
+;	tax							; move the command table offset to x
+;	lda	commandtableH+128,x		; load MSB of the command address
+;	pha							; push it on the stack
+;	lda	commandtableL+128,x		; load LSB of the command address
+;	pha							; push it on the stack	
+;	rts							; call address on the stack
+;.ENDIF
+.ENDIF
+
+
+;**************************************************************
+
+
+
+;**************************************************************
+;* command table
+;**************************************************************
+;* Description:
+;*   A table of pointers to any commands we create to be used from the player.
+;*   Table must not cross a page boundary
+;*   65C02 version uses word pointers 
+;*   6502 version uses High and Low byte tables for pointers
+;**************************************************************	
+.IF	USE_C02 > 0
+commandtable:
+	.word	playsongend		; 0 end of song
+	.word	playsongend		; just in case
+.ELSE
+;.IF  = 0
+commandtable:
+	.word	playsongend		; 0 end of song
+	.word	playsongend		; just in case
+;.ELSE
+;commandtableH:
+;	.byt	>playsongend		; 0 end of song
+;	.byt	>playsongend		; just in case
+;commandtableL:
+;	.byt	<playsongend		; 0 end of song
+;	.byt	<playsongend		; just in case
+
+.ENDIF
+;**************************************************************
+
+.ENDIF
+
+	
+	
+
+
+codeend:
+	
+	.data							; start of the bss data segment
+;**************************************************************
+;* variables
+;**************************************************************
+;_VblCounter:	.byt	0			; TOF flag variable (not used at this time)
+SAVE_IRQ:		.byt	00,00		; place to store the existing interrupt handler's address
+songstart:		.byt	00,00		; holds the current song pointer so we can reset the pointer to the start on repeat.
+;**************************************************************
+
+
+
+;**************************************************************
+;* songtable
+;**************************************************************
+;* Description:
+;*   table of pointers to songs
+;*   any unsupported song is set to enptysong
+;*   All gameplay screens initially play the girders song like the Colecovision version
+;**************************************************************
+songtable:
+	.word	emptysong				; intro screen
+	.word	howhigh					; how high can you get?
+	.word	screen1					; girders
+	.word	screen2					; conveyer
+	.word	screen1					; springs
+	.word	screen4					; rivets
+	.word	emptysong				; Complete Girder Level
+	.word	emptysong				; Complete Rivet 1
+	.word	emptysong				; Complete Rivet 2
+	.word	emptysong				; Kong Taunting
+	.word	emptysong				; Kong Fall/saved girl
+	.word	emptysong				; Hammertime
+	.word	emptysong				; Die
+	.word	emptysong				; Out of time
+;**************************************************************
+
+
+
+;**************************************************************
+;* howhigh
+;**************************************************************
+;* Description:
+;*   Song for the 'How High Can You Get?' screen
+;*   It currently sounds horrible because I'm working on timing
+;*   first.
+;**************************************************************
+howhigh:
+	.byt	1,4,7,56,1,0,0,244,8,15		;1st note
+	.byt	6,1,8,8
+	.byt	11,2,0,217,8,15					;2nd note
+	
+	.byt	6,1,8,2
+	.byt	12,2,0,205,8,15					;3rd note
+;	.byt	8,1,8,0
+	.byt	2,1,8,14
+	.byt	2,1,8,13
+	.byt	2,1,8,12
+	.byt	2,1,8,0
+	.byt	14,2,0,222,8,15					;4th note
+	.byt	6,1,8,7
+	.byt	5,2,0,244,8,15					;5th note
+	.byt	4,1,8,0
+	.byt	7,2,0,222,8,15					;6th note
+	.byt	8,1,8,0
+	.byt	4,2,0,244,8,15					;7th note
+	.byt	4,1,8,12
+	.byt	4,1,8,10
+	.byt	4,1,8,5
+	.byt	4,1,8,2
+	.byt	7,3,1,1,0,232,8,11				;8th note
+	.byt	6,2,0,110,8,11					;9th note
+	.byt	6,2,0,2,8,11					;10th note
+	.byt	6,3,1,0,0,193,8,11					;11th note
+	.byt	6,3,1,1,0,70,8,11					;12th note
+	.byt	4,1,8,7
+	.byt	4,1,8,4
+	.byt	4,1,8,0
+
+;	.byt	1,0								; done
+	.byt	33,255							; repeat forever
+;**************************************************************
+
+
+
+;**************************************************************
+;* screen1
+;**************************************************************
+;* Description:
+;*   Donkey Kong Screen 1 (girders) background tune
+;**************************************************************
+screen1:
+	.byt	1,4,7,56,1,$01,0,$E8,8,9		;1st note
+	.byt	4,1,8,0
+	.byt	12,2,0,$E8,8,9			;2nd note
+	.byt	4,1,8,0
+	.byt	4,2,0,$83,8,9			;3rd note
+	.byt	4,1,8,0
+	.byt	6,2,0,$B3,8,9			;4th note
+	.byt	4,1,8,0
+	.byt	6,3,1,$02,0,$45,8,9		;5th note
+	.byt	4,1,8,0
+	.byt	19,255						;repeat forever
+;**************************************************************
+
+
+
+;**************************************************************
+;* screen2
+;**************************************************************
+;* Description:
+;*   Donkey Kong Screen 2 (conveyers) background tune
+;*   Just three repeating notes with a rest
+;**************************************************************
+screen2:
+	.byt	1,4,8,$00,9,$00,10,$00,7,56
+	.byt	8,3,1,$01,0,$E8,8,9			;1st note
+	.byt	5,1,8,0
+	.byt	2,2,0,$E8,8,9				;2nd note
+	.byt	5,1,8,0
+	.byt	2,2,0,$E8,8,9				;3rd note
+	.byt	5,1,8,0
+	.byt	1,255						;repeat forever
+;**************************************************************
+
+
+
+;**************************************************************
+;* screen4
+;**************************************************************
+;* Description:
+;*   Donkey Kong Screen 4 (rivets) background tune
+;*   Just three repeating notes with a rest
+;**************************************************************
+screen4:
+	.byt	1,4,8,$00,9,$00,10,$00,7,56
+	.byt	8,3,1,$01,0,$E8,8,9			; 1st note, volume 9
+	.byt	5,1,8,0						; stop note by setting volume to zero
+;	.byt	2,3,1,$01,0,$E8,8,9			; 2nd note, volume 9
+	.byt	2,1,8,9						; 2nd note, volume 9
+	.byt	5,1,8,0						; stop note by setting volume to zero
+;	.byt	2,3,1,$01,0,$B3,8,9			;3rd note
+	.byt	2,2,0,$B3,8,9				;3rd note, volume 9
+	.byt	5,1,8,0						; stop note by setting volume to zero
+	.byt	1,255						;repeat forever
+;**************************************************************
+
+
+;**************************************************************
+;* emptysong
+;**************************************************************
+;* Description:
+;*   A song that just turns off the volume on the AY channel I'm using for music
+;*   and then exits.  On exit, the player sets the playing flag to zero so the
+;*   interrupt will exit without playing.
+;**************************************************************
+emptysong:
+	.byt	1,1,8,0						; set volume of chvannel A to 0
+	.byt	1,0							; done
+;**************************************************************
+
+
+
+;**************************************************************
+;* chord
+;**************************************************************
+;* just playing with chords.  
+;* These are from the Tandy Speech & Sound Pak demo.
+;* It's hardware uses a different clock speed so it needs adjusted
+;* for the Mockingboard.  
+;**************************************************************
+chord:
+	.byt	 1, 14,0,172,1,1,2, 83,3,1,4, 29, 5,1,6,0,7,56,8,9,9,9,10,9,11,0,12,0,13,0	; C chord
+	.byt	64,  3,          2, 64,    4,254, 5,0	; F chord
+	.byt	64,  4,0,197,    2,125,    4, 29, 5,1	; G chord
+	.byt	63,255
+;**************************************************************
+	
+	
+;**************************************************************
+;*
+;**************************************************************
+;* Unused.
+;**************************************************************
+	.byt	159,15,15,191,15,15,224,15,15,98,0,14,5,0,0,0,0
+;**************************************************************
+
+DATAEND:				; so we have the end of the data in the list file for debugging
+	
+	;.end
